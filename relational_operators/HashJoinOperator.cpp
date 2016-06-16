@@ -48,6 +48,7 @@
 #include "types/TypedValue.hpp"
 #include "types/containers/ColumnVector.hpp"
 #include "types/containers/ColumnVectorsValueAccessor.hpp"
+#include "utility/EventProfiler.hpp"
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
@@ -302,7 +303,8 @@ bool HashJoinOperator::getAllNonOuterJoinWorkOrders(
                                      selection,
                                      hash_table,
                                      output_destination,
-                                     storage_manager),
+                                     storage_manager,
+                                     static_cast<int>(op_index_)),
               op_index_);
         }
         started_ = true;
@@ -322,7 +324,8 @@ bool HashJoinOperator::getAllNonOuterJoinWorkOrders(
                 selection,
                 hash_table,
                 output_destination,
-                storage_manager),
+                storage_manager,
+                static_cast<int>(op_index_)),
             op_index_);
         ++num_workorders_generated_;
       }  // end while
@@ -525,10 +528,20 @@ void HashInnerJoinWorkOrder::execute() {
 
 template <typename CollectorT>
 void HashInnerJoinWorkOrder::executeWithCollectorType() {
+  auto *container = simple_profiler.getContainer();
+//  auto *hash_join_line = container->getEventLine("hashJoin");
+//  hash_join_line->emplace_back();
+
+//  auto *get_probe_block_line = container->getEventLine("getProbeBlock");
+//  get_probe_block_line->emplace_back();
   BlockReference probe_block(
       storage_manager_->getBlock(block_id_, probe_relation_));
   const TupleStorageSubBlock &probe_store = probe_block->getTupleStorageSubBlock();
+//  get_probe_block_line->back().endEvent();
+//  get_probe_block_line->back().setPayload(getOperatorIndex());
 
+//  auto *collect_matches_line = container->getEventLine("collectMatches");
+//  collect_matches_line->emplace_back();
   std::unique_ptr<ValueAccessor> probe_accessor(probe_store.createValueAccessor());
   CollectorT collector;
   if (join_key_attributes_.size() == 1) {
@@ -545,16 +558,30 @@ void HashInnerJoinWorkOrder::executeWithCollectorType() {
         &collector);
   }
   collector.consolidate();
+//  collect_matches_line->back().endEvent();
+//  collect_matches_line->back().setPayload(getOperatorIndex());
 
   const relation_id build_relation_id = build_relation_.getID();
   const relation_id probe_relation_id = probe_relation_.getID();
 
+  auto *materialize_line = container->getEventLine("materialize");
+  materialize_line->emplace_back();
+  auto *get_build_block_line = container->getEventLine("getBuildBlock");
+  auto *create_temp_line = container->getEventLine("createTempResults");
+  auto *bulk_insert_line = container->getEventLine("bulkInsertTuples");
+  auto *pair_iteration_line = container->getEventLine("pairIteration");
+  pair_iteration_line->emplace_back();
   for (std::pair<const block_id, std::vector<std::pair<tuple_id, tuple_id>>>
            &build_block_entry : *collector.getJoinedTuples()) {
+    pair_iteration_line->back().setPayload(getOperatorIndex());
+    pair_iteration_line->back().endEvent();
+    get_build_block_line->emplace_back();
     BlockReference build_block =
         storage_manager_->getBlock(build_block_entry.first, build_relation_);
     const TupleStorageSubBlock &build_store = build_block->getTupleStorageSubBlock();
     std::unique_ptr<ValueAccessor> build_accessor(build_store.createValueAccessor());
+    get_build_block_line->back().setPayload(getOperatorIndex());
+    get_build_block_line->back().endEvent();
 
     // Evaluate '*residual_predicate_', if any.
     //
@@ -600,6 +627,7 @@ void HashInnerJoinWorkOrder::executeWithCollectorType() {
     // benefit (probably only a real performance win when there are very few
     // matching tuples in each individual inner block but very many inner
     // blocks with at least one match).
+    create_temp_line->emplace_back();
     ColumnVectorsValueAccessor temp_result;
     for (vector<unique_ptr<const Scalar>>::const_iterator selection_cit = selection_.begin();
          selection_cit != selection_.end();
@@ -610,13 +638,25 @@ void HashInnerJoinWorkOrder::executeWithCollectorType() {
                                                                   probe_accessor.get(),
                                                                   build_block_entry.second));
     }
+    create_temp_line->back().endEvent();
+    create_temp_line->back().setPayload(getOperatorIndex());
 
     // NOTE(chasseur): calling the bulk-insert method of InsertDestination once
     // for each pair of joined blocks incurs some extra overhead that could be
     // avoided by keeping checked-out MutableBlockReferences across iterations
     // of this loop, but that would get messy when combined with partitioning.
+    bulk_insert_line->emplace_back();
     output_destination_->bulkInsertTuples(&temp_result);
+    bulk_insert_line->back().endEvent();
+    bulk_insert_line->back().setPayload(getOperatorIndex());
+    pair_iteration_line->emplace_back();
   }
+  pair_iteration_line->back().setPayload(getOperatorIndex());
+  pair_iteration_line->back().endEvent();
+  materialize_line->back().endEvent();
+  materialize_line->back().setPayload(getOperatorIndex());
+//  hash_join_line->back().endEvent();
+//  hash_join_line->back().setPayload(getOperatorIndex());
 }
 
 void HashSemiJoinWorkOrder::execute() {

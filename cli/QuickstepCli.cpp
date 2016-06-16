@@ -52,6 +52,9 @@ typedef quickstep::LineReaderDumb LineReaderImpl;
 #include <gperftools/profiler.h>
 #endif
 
+#include "catalog/CatalogDatabase.hpp"
+#include "catalog/CatalogRelation.hpp"
+#include "catalog/CatalogRelationConstraints.hpp"
 #include "cli/DefaultsConfigurator.hpp"
 #include "cli/InputParserUtil.hpp"
 #include "cli/PrintToScreen.hpp"
@@ -75,6 +78,7 @@ typedef quickstep::LineReaderDumb LineReaderImpl;
 
 #include "storage/PreloaderThread.hpp"
 #include "threading/ThreadIDBasedMap.hpp"
+#include "utility/DAGVisualizer.hpp"
 #include "utility/EventProfiler.hpp"
 #include "utility/Macros.hpp"
 #include "utility/PtrVector.hpp"
@@ -89,6 +93,8 @@ typedef quickstep::LineReaderDumb LineReaderImpl;
 #include "tmb/id_typedefs.h"
 #include "tmb/message_bus.h"
 #include "tmb/message_style.h"
+
+#include "google/protobuf/text_format.h"
 
 namespace quickstep {
 class CatalogRelation;
@@ -188,8 +194,30 @@ DEFINE_string(profile_file_name, "",
               // run at least a hundred times to make the impact of the first run small (< 5 %).
 DEFINE_string(profile_output, "",
               "Output file name for writing the profiled events.");
+DEFINE_bool(visualize_dag, false,
+            "If true, visualize the execution plan DAG into a graph in DOT format.");
 
 }  // namespace quickstep
+
+void addPrimaryKeyInfoForTPCHTables(quickstep::CatalogDatabase *database) {
+  const std::vector<std::pair<std::string, std::vector<std::string>>> rel_pkeys = {
+      { "region", { "r_regionkey" } },
+      { "nation", { "n_nationkey" } },
+      { "supplier", { "s_suppkey" } },
+      { "customer", { "c_custkey" } },
+      { "part", { "p_partkey" } },
+      { "partsupp", { "ps_partkey", "ps_suppkey" } },
+      { "orders", { "o_orderkey" } }
+  };
+  for (const auto &rel_pair : rel_pkeys) {
+    CatalogRelation *rel = database->getRelationByNameMutable(rel_pair.first);
+    std::vector<quickstep::attribute_id> attrs;
+    for (const auto &pkey : rel_pair.second) {
+      attrs.emplace_back(rel->getAttributeByName(pkey)->getID());
+    }
+    rel->getConstraintsMutable()->setPrimaryKey(attrs);
+  }
+}
 
 int main(int argc, char* argv[]) {
   google::InitGoogleLogging(argv[0]);
@@ -298,6 +326,12 @@ int main(int argc, char* argv[]) {
   } catch (...) {
     LOG(FATAL) << "NON-STANDARD EXCEPTION DURING STARTUP";
   }
+
+//  addPrimaryKeyInfoForTPCHTables(query_processor->getDefaultDatabase());
+//  std::string proto_str;
+//  google::protobuf::TextFormat::PrintToString(
+//      query_processor->getDefaultDatabase()->getProto(), &proto_str);
+//  std::cerr << proto_str << "\n";
 
   // Parse the CPU affinities for workers and the preloader thread, if enabled
   // to warm up the buffer pool.
@@ -437,6 +471,8 @@ int main(int argc, char* argv[]) {
         }
 
         DCHECK(query_handle->getQueryPlanMutable() != nullptr);
+        quickstep::simple_profiler.clear();
+        quickstep::relop_profiler.clear();
         start = std::chrono::steady_clock::now();
         QueryExecutionUtil::ConstructAndSendAdmitRequestMessage(
             main_thread_client_id,
@@ -448,6 +484,11 @@ int main(int argc, char* argv[]) {
           QueryExecutionUtil::ReceiveQueryCompletionMessage(
               main_thread_client_id, &bus);
           end = std::chrono::steady_clock::now();
+
+          if (quickstep::FLAGS_visualize_dag) {
+            quickstep::DAGVisualizer visualizer(*query_handle->getQueryPlanMutable());
+            std::cerr << "\n" << visualizer.toDOT() << "\n";
+          }
 
           const CatalogRelation *query_result_relation = query_handle->getQueryResultRelation();
           if (query_result_relation) {
@@ -477,7 +518,6 @@ int main(int argc, char* argv[]) {
           if (!quickstep::FLAGS_profile_output.empty()) {
             std::ofstream ofs(quickstep::FLAGS_profile_output, std::ios::out);
             quickstep::simple_profiler.writeToStream(ofs);
-            quickstep::simple_profiler.clear();
             ofs.close();
           }
         } catch (const std::exception &e) {
